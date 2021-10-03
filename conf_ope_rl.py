@@ -6,7 +6,11 @@ import matplotlib.pyplot as plt
 import gurobipy as gp
 from joblib import Parallel, delayed
 from copy import deepcopy
-
+import cvxpy as cvx
+from scipy.sparse import lil_matrix
+import mosek
+from datetime import datetime
+import pickle
 
 
 
@@ -88,13 +92,22 @@ def get_pib(nA,nS, a_s, stateHist):
         p_a1_su[a,:] = [sum( (a_s==a) & (stateHist[:-1,s]==1) ) / sum(stateHist[:-1,s]) for s in range(nS)]
     return p_a1_su
 
+def get_pib_counts(nA,nS, a_s, stateHist): 
+    '''
+    # estimate counts of p(a \mid s)
+    '''
+    p_a1_su_counts = np.zeros([nA, nS])
+    for a in range(nA): 
+        p_a1_su_counts[a,:] = [sum( (a_s==a) & (stateHist[:-1,s]==1) )  for s in range(nS)]
+    return p_a1_su_counts
+
 def get_cndl_s_a_sprime(s_a_sprime, distrib):
     assert np.isclose(distrib.sum(), 1)
     joint_s_a_sprime = s_a_sprime / np.sum(s_a_sprime)
     s_a_giv_sprime = joint_s_a_sprime / distrib
-    # for k in range(s_a_giv_sprime.shape[2]): 
-    #     if not np.isclose((s_a_giv_sprime[:,:,k].sum()), 1,atol = 0.01): 
-    #         print 'conditional not well behaved for s='k
+    for k in range(s_a_giv_sprime.shape[2]):
+        if not np.isclose((s_a_giv_sprime[:,:,k].sum()), 1,atol = 0.01):
+            print 'conditional not well behaved for s='+str(k)
     return [joint_s_a_sprime, s_a_giv_sprime]
 
 
@@ -130,7 +143,7 @@ def simulate_rollouts( nS, nA, P, Pi, state_dist, n ):
         # calculate the actual distribution over the 3 states so far
         totals=np.sum(stateHist,axis=0)
         gt=np.sum(totals)
-        distrib=totals/gt
+        distrib=totals*1.0/gt
         distrib=np.reshape(distrib,(1,nS))
         distr_hist=np.append(distr_hist,distrib,axis=0)
 
@@ -177,24 +190,75 @@ def get_auxiliary_info_from_traj(stateChangeHist, stateHist, a_s, s_a_sprime, di
     [joint_s_a_sprime, s_a_giv_sprime] = get_cndl_s_a_sprime(s_a_sprime, distrib)
     return [ p_a1_su, joint_s_a_sprime, s_a_giv_sprime ]
 
-def get_auxiliary_info_from_all_trajectories(res, nA,nS): 
+
+def get_agg_auxiliary_info_from_all_trajectories(res, nA,nS, nSmarg, nU): 
     # s_a_sprime_cum = np.zeros([nS,nA,nS])
     # assume all trajectories of same length
+    # better to compute running averages rather than 
     [ stateChangeHist, stateHist, a_s, s_a_sprime, distrib, distr_hist ] = res[0] 
+    N = len(res); 
     s_a_sprime_cum = s_a_sprime
-    for traj in res[1:]: 
-        [ stateChangeHist_, stateHist_, a_s_, s_a_sprime_, distrib, distr_hist ] = traj 
-        np.vstack([stateHist, stateHist_])
-        np.vstack([a_s, a_s_])
-        s_a_sprime_cum = s_a_sprime_cum + s_a_sprime_
+    p_a1_su = get_pib_counts(nA,nS, a_s, stateHist); 
 
-    totals=np.sum(stateHist,axis=0); gt=np.sum(totals); distrib=totals/gt; distrib=np.reshape(distrib,(1,nS))
-    p_a1_su = get_pib(nA,nS, a_s, stateHist); 
-    print s_a_sprime_cum.shape
-    print distrib
-    print ((s_a_sprime_cum/s_a_sprime_cum.sum())/distrib)[:,:,0]
+    aggStateHist = reshape_byxrow(stateHist.T, nU).T; 
+    agg_s_a_sprime_cum = agg_state(nS,nSmarg,nU,nA,s_a_sprime)
+    p_a1_s = get_pib_counts(nA,nSmarg, a_s, aggStateHist); 
+    i = 0
+    # totals=np.sum(stateHist,axis=0); gt=np.sum(totals); distrib=totals/gt; distrib=np.reshape(distrib,(1,nS))
+    for traj in res[1:]: 
+        if i%100==0: 
+            print i
+        i+=1; 
+        [ stateChangeHist_, stateHist_, a_s_, s_a_sprime_, distrib_, distr_hist ] = traj 
+        p_a1_su_ = get_pib_counts(nA,nS, a_s_, stateHist_) # takes too much memory to store history  # stateHist = np.vstack([stateHist, stateHist_])        # a_s = np.vstack([a_s, a_s_.reshape([len(a_s_),1]) ])
+        # append 
+        s_a_sprime_cum = s_a_sprime_cum + s_a_sprime_; p_a1_su += p_a1_su_; distrib += distrib_
+        # aggregate history online 
+        aggStateHist_ = reshape_byxrow(stateHist_.T, nU).T
+        agg_s_a_sprime_ = agg_state(nS,nSmarg,nU,nA,s_a_sprime_)
+        p_a1_s_ = get_pib_counts(nA,nSmarg, a_s, aggStateHist_)
+        agg_s_a_sprime_cum = agg_s_a_sprime_cum + agg_s_a_sprime_; p_a1_s += p_a1_s_
+    # take average over trajectories
+    distrib = (distrib / distrib.sum()) ; # p_infty_b_su
+    # print distrib
+    p_a1_su = p_a1_su / N; p_a1_su = p_a1_su/ p_a1_su.sum(axis=0) # return probabilities
+    p_a1_s = p_a1_s / N; p_a1_s = p_a1_s/ p_a1_s.sum(axis=0)
+    # print ((s_a_sprime_cum/s_a_sprime_cum.sum())/distrib)[:,:,0]
     [joint_s_a_sprime, s_a_giv_sprime] = get_cndl_s_a_sprime(s_a_sprime_cum, distrib.flatten())
-    return [ p_a1_su, joint_s_a_sprime, s_a_giv_sprime, s_a_sprime, stateHist, a_s, distrib]
+
+    p_infty_b_s = (reshape_byxrow(distrib.T,nU).T ).flatten()
+    [joint_s_a_sprime_agg, s_a_giv_sprime_agg] = get_cndl_s_a_sprime(agg_s_a_sprime_cum, p_infty_b_s)
+    # return [aggStateHist, p_a1_s, p_e_s, agg_s_a_sprime, joint_s_a_sprime_agg, s_a_giv_sprime_agg]
+
+    return [ p_a1_su, joint_s_a_sprime, s_a_giv_sprime, s_a_sprime_cum, p_a1_s, joint_s_a_sprime_agg, s_a_giv_sprime_agg, agg_s_a_sprime_cum, distrib]
+
+## deprecated version that keeps things in memory
+# def get_auxiliary_info_from_all_trajectories(res, nA,nS): 
+
+#     # s_a_sprime_cum = np.zeros([nS,nA,nS])
+#     # assume all trajectories of same length
+#     [ stateChangeHist, stateHist, a_s, s_a_sprime, distrib, distr_hist ] = res[0] 
+#     N = len(res)
+#     a_s = a_s.reshape([len(a_s),1])
+#     s_a_sprime_cum = s_a_sprime
+#     totals=np.sum(stateHist,axis=0); gt=np.sum(totals); distrib=totals/gt; distrib=np.reshape(distrib,(1,nS))
+#     for traj in res[1:]: 
+#         [ stateChangeHist_, stateHist_, a_s_, s_a_sprime_, distrib, distr_hist ] = traj 
+#         stateHist = np.vstack([stateHist, stateHist_])
+#         a_s = np.vstack([a_s, a_s_.reshape([len(a_s_),1]) ])
+#         s_a_sprime_cum = s_a_sprime_cum + s_a_sprime_
+#         totals=np.sum(stateHist_,axis=0); gt=np.sum(totals); distrib_=totals/gt; distrib_=np.reshape(distrib,(1,nS))
+#         distrib += distrib_
+#     print 'a_s shape', a_s.shape
+#     print 'statehist shape', stateHist.shape
+#     distrib = distrib / N # take average over trajectories
+#     print 'stat dist p_b(s)', distrib
+#     # totals=np.sum(stateHist,axis=0); gt=np.sum(totals); distrib=totals/gt; distrib=np.reshape(distrib,(1,nS))
+#     p_a1_su = get_pib(nA,nS, a_s, stateHist); 
+    
+#     print ((s_a_sprime_cum/s_a_sprime_cum.sum())/distrib)[:,:,0]
+#     [joint_s_a_sprime, s_a_giv_sprime] = get_cndl_s_a_sprime(s_a_sprime_cum, distrib.flatten())
+#     return [ p_a1_su, joint_s_a_sprime, s_a_giv_sprime, s_a_sprime, stateHist, a_s, distrib]
 
 def agg_history(stateHist, s_a_sprime, p_infty_b_s, a_s, p_e_su, nA, nS, nSmarg, nU): 
     '''
@@ -1225,15 +1289,19 @@ def primal_opt_outer_L1_(gamma, phi, a_bnd,b_bnd, s_a_giv_sprime, p_infty_b, pe_
 
 def primal_opt_outer_L1_test_function(gamma, phi, a_bnd,b_bnd, s_a_giv_sprime, p_infty_b, pe_s, p_a1_s,
                        nS, nA, tight= True, sense_min = True, quiet = True):
+    '''
+    Optimize over primal with L1 feasibility oracle; with p_infty_b() test function
+    '''
+
     for k in range(nS): 
         assert np.isclose((s_a_giv_sprime[:,:,k].sum()), 1,atol = 0.01)
     assert np.isclose(sum(p_infty_b), 1)
     m = gp.Model()
     p_infty_b = p_infty_b.flatten()
 #     w = m.addVars(nS)
-    g = m.addVars(nS,nA,nS) #\beta_k(a\mid j)
-    z = m.addVars(nS) 
-    w = m.addVars(nS) 
+    g = m.addVars(nS,nA,nS, name='g') #\beta_k(a\mid j)
+    z = m.addVars(nS,name='z') 
+    w = m.addVars(nS,name='w') 
     if quiet: m.setParam("OutputFlag", 0)
     epsilon = 0.1
     m.params.NonConvex = 2
@@ -1273,8 +1341,15 @@ def primal_opt_outer_L1_test_function(gamma, phi, a_bnd,b_bnd, s_a_giv_sprime, p
     else: 
         return [None, None, None]
 
+
+
 def primal_opt_outer_L1_test_function_joint_distn(gamma, phi, a_bnd,b_bnd, joint_s_a_sprime, p_infty_b, pe_s, 
                        nS, nA, tight= True, sense_min = True, quiet = True):
+    '''
+
+    instrument function
+    next-state conditional control variates
+    '''
     assert np.isclose((joint_s_a_sprime.sum()), 1,atol = 0.01)
     print nS
     # assert np.isclose((p_infty_b.sum()), 1,atol = 0.01)
@@ -1559,6 +1634,563 @@ def westward_wind_grid_world_example(grid_size=(3, 3),
 
     return P, R
 
+'''
+Modifications for F(w), e.g. for linear function approximation 
+'''
+def primal_F_beta_L1_empirical_expectations(theta, states, a_bnd,b_bnd, pi_s_obsa,
+                       feature_coefficients, N,T, tight= True, quiet = True):
+    '''
+    :param theta:
+    :param states:
+    :param a_bnd:
+    :param b_bnd:
+    :param pi_s_obsa:
+    :param feature_coefficients:
+    :param N:
+    :param T:
+    :param tight:
+    :param sense_min:
+    :param quiet:
+    :return:
+    '''
+    m = gp.Model()
+    dTheta = len(theta)
+    g = m.addVars(N,T) #\beta_k(a\mid j)
+    z = m.addVars(dTheta)
+    if quiet: m.setParam("OutputFlag", 0)
+    epsilon = 0.1
+    m.params.NonConvex = 2
+
+    [Psi_theta_NT_tt1, Psi_theta_NT_t1t1, Psi_NT_tt1,  bar_psi, bar_Psi_t1t1] = feature_coefficients
+
+    for k in range(dTheta):
+        m.addConstr( z[k] >= 1.0/ (N*(T-1)) * gp.quicksum(gp.quicksum( ([pi_s_obsa[i,t] *  Psi_theta_NT_tt1[i,t] * g[i,t] - Psi_theta_NT_t1t1[i,t] for t in range(T-1)]) for i in range(N) )) )
+        m.addConstr( z[k] >= -1.0/ (N*(T-1)) * gp.quicksum(gp.quicksum( ([pi_s_obsa[i,t] *  Psi_theta_NT_tt1[i,t] * g[i,t] - Psi_theta_NT_t1t1[i,t] for t in range(T-1)]) for i in range(N) )) )
+    for i in range(N):
+        for t in range(T):
+                m.addConstr(g[i,t] <= b_bnd[i,t])
+                m.addConstr(g[i,t] >= a_bnd[i,t])
+    for a in range(nA):
+        if tight:
+            m.addConstr(1.0/(N*T) * gp.quicksum([g[i,t] * (a_s[i,t] == a).astype(int) for i in range(N) for t in range(T) ] ) == 1)
+        else:
+            m.addConstr(1.0 / (N * T) * gp.quicksum(
+                        [g[i, t] * (a_s[i, t] == a).astype(int) for i in range(N) for t in range(T)]) - 1 <= epsilon)
+            m.addConstr(1 - 1.0 / (N * T) * gp.quicksum(
+                        [g[i, t] * (a_s[i, t] == a).astype(int) for i in range(N) for t in range(T)])<= epsilon)
+    m.update()
+    expr = gp.quicksum( z )
+    m.setObjective(expr, gp.GRB.MINIMIZE);
+    m.optimize()
+    if (m.status == gp.GRB.OPTIMAL):
+        return [m.objVal, m]
+    else:
+        return [None, None]
+
+def primal_outerF_beta_L1_empirical_expectations(reward_coefs, feature_coefficients, a_bnd,b_bnd, pi_s_obsa,a_s, N,T,nA,
+                                        tight= True, sense_min = True, quiet = True):
+    '''
+    Preprocess coefficients
+    :param psi_fn:
+    :param reward_coefs:
+    :param a_bnd:
+    :param b_bnd:
+    :param pi_s_obsa:
+    :param feature_coefficients:
+    :param N:
+    :param T:
+    :param tight:
+    :param sense_min:
+    :param quiet:
+    :return:
+    '''
+    m = gp.Model()
+    [Psi_theta_NT_tt1, Psi_theta_NT_t1t1, Psi_NT_tt1,  bar_psi, bar_Psi_t1t1] = feature_coefficients
+    dtheta = len(bar_psi)
+    g = m.addVars(N,T) #\beta_k(a\mid j)
+    z = m.addVars(dtheta)
+    theta = m.addVars(dtheta)
+    if quiet: m.setParam("OutputFlag", 0)
+    epsilon = 0.1
+    m.params.NonConvex = 2
+
+    m.addConstr( gp.quicksum(z) <= 5 , 'optimalityresidual')
+    for k in range(dtheta):
+        m.addConstr(z[k] >= -1*N*T* gp.quicksum(bar_Psi_t1t1[k,l] * theta[l] for l in range(dtheta))
+            +  gp.quicksum(
+            gp.quicksum(pi_s_obsa[i, t] *gp.quicksum([Psi_NT_tt1[i,t,k,l]*theta[l] for l in range(dtheta)])
+              * g[i, t] for t in range(T - 1)) for i in range(N) )
+        )
+        m.addConstr(z[k] >=
+            N*T*gp.quicksum(bar_Psi_t1t1[k,l] * theta[l] for l in range(dtheta))
+        - gp.quicksum(
+            gp.quicksum(pi_s_obsa[i, t] *gp.quicksum( [Psi_NT_tt1[i,t,k,l]*theta[l] for l in range(dtheta)])
+              * g[i, t] for t in range(T - 1))
+            for i in range(N)
+            )
+        )
+    # scale NT
+    # for k in range(dtheta):
+    #     m.addConstr(z[k] >= -1* gp.quicksum(bar_Psi_t1t1[k,l] * theta[l] for l in range(dtheta))
+    #         +  1.0 / (N * (T )) * gp.quicksum(
+    #         gp.quicksum(pi_s_obsa[i, t] *gp.quicksum([Psi_NT_tt1[i,t,k,l]*theta[l] for l in range(dtheta)])
+    #           * g[i, t] for t in range(T - 1)) for i in range(N) )
+    #     )
+    #     m.addConstr(z[k] >=
+    #         gp.quicksum(bar_Psi_t1t1[k,l] * theta[l] for l in range(dtheta))
+    #     - 1.0 / (N * (T )) * gp.quicksum(
+    #         gp.quicksum(pi_s_obsa[i, t] *gp.quicksum( [Psi_NT_tt1[i,t,k,l]*theta[l] for l in range(dtheta)])
+    #           * g[i, t] for t in range(T - 1))
+    #         for i in range(N)
+    #         )
+    #     )
+    for i in range(N):
+        for t in range(T):
+                m.addConstr(g[i,t] <= b_bnd[i,t])
+                m.addConstr(g[i,t] >= a_bnd[i,t])
+    # m.addConstr( gp.quicksum(theta[k] for k in range(dtheta)) >= 0.1)
+    m.addConstr( gp.quicksum( theta[k]*bar_psi[k] for k in range(dtheta)) == 1) # \E[ w(s) ] = 1 where w = \phi(s)^\top \theta
+
+    # for a in range(nA):
+    #     if tight:
+    #         m.addConstr(1.0 / (N * T) * gp.quicksum(
+    #             [g[i, t] * (a_s[i, t] == a).astype(int) for i in range(N) for t in range(T)]) == 1)
+    #     else:
+    #         m.addConstr(1.0 / (N * T) * gp.quicksum(
+    #             [g[i, t] * (a_s[i, t] == a).astype(int) for i in range(N) for t in range(T)]) - 1 <= epsilon)
+    #         m.addConstr(1 - 1.0 / (N * T) * gp.quicksum(
+    #             [g[i, t] * (a_s[i, t] == a).astype(int) for i in range(N) for t in range(T)]) <= epsilon)
+
+    m.update()
+    expr = gp.LinExpr();
+    if sense_min:
+        expr += gp.quicksum( [theta[k] * reward_coefs[k] for k in range(dtheta)] )
+    else:
+        expr += gp.quicksum( [-1*theta[k] * reward_coefs[k] for k in range(dtheta)] )
+    m.setObjective(expr, gp.GRB.MINIMIZE);
+    m.params.NonConvex = 2
+    m.update()
+    m.optimize()
+
+    # Feasibility relaxation
+    if m.status != gp.GRB.INFEASIBLE:
+        print 'feasibility relaxation'
+        m.feasRelax(0, False, None, None, None, [m.getConstrByName('optimalityresidual')], [1])
+        m.params.NonConvex = 2
+        m.update()
+        m.optimize()
+
+    if (m.status == gp.GRB.OPTIMAL):
+        theta_ = [theta[k].x for k in range(dtheta)]
+        if sense_min:
+            return [m.objVal, theta_, m]
+        else:
+            return [-1*m.objVal, theta_, m]
+    else:
+        return [None, None, None]
+
+
+def dual_opt_outer_L1_empirical_expectations(reward_coefs, feature_coefficients, a_bnd,b_bnd, pi_s_obsa,a_s, N,T,nA,
+                                        tight= True, sense_min = True, quiet = True):
+    m = gp.Model()
+    c = m.addVars(N,T, lb=0)
+    d = m.addVars(N,T, lb=0)
+    [Psi_theta_NT_tt1, Psi_theta_NT_t1t1, Psi_NT_tt1,  bar_psi, bar_Psi_t1t1] = feature_coefficients
+    dtheta = len(bar_psi)
+    theta = m.addVars(dtheta)
+    lmbda01 = m.addVars(dtheta, vtype=gp.GRB.BINARY);
+    #lmbda = m.addVars(nS, lb = -1*gp.GRB.INFINITY)
+    if tight:
+        mu = m.addVars(nA, lb=-1 * gp.GRB.INFINITY)
+    m.update()
+    if quiet: m.setParam("OutputFlag", 0)
+    m.params.NonConvex = 2
+
+    for i in range(N):
+        for t in range(T-1):
+            m.addConstr(c[i,t] - d[i,t] +
+                        - 1.0/(N*T) * pi_s_obsa[i,t] * gp.quicksum(
+                (2 * lmbda01[k] - 1)*
+                gp.quicksum( Psi_NT_tt1[i,t,k,l]*theta[k] for l in range(dtheta) )
+                for k in range(dtheta) )
+                        + 1.0/(N*T) *mu[a_s[i,t]]
+                        == 0)
+    # for k in range(dtheta):
+    #     m.addConstr(lmbda[k] <= 1)
+    #     m.addConstr(lmbda[k] >= -1)
+
+    m.addConstr( gp.quicksum(c[i,t] * a_bnd[i,t] for i in range(N) for t in range(T) )
+                 + gp.quicksum(-1 * d[i,t] * b_bnd[i,t] for i in range(N) for t in range(T))
+                 + gp.quicksum(-1 * (2 * lmbda01[k] - 1)*
+                gp.quicksum( bar_Psi_t1t1[k,l]*theta[k] for l in range(dtheta) )
+                        for k in range(dtheta) )
+                + gp.quicksum(mu)
+                 == 0 )
+    m.update()
+
+    expr = gp.LinExpr()
+    if sense_min:
+        expr += gp.quicksum( [theta[k] * reward_coefs[k] for k in range(dtheta)] )
+    else:
+        expr += gp.quicksum( [-1*theta[k] * reward_coefs[k] for k in range(dtheta)] )
+
+    # need to change for discounted case
+    m.setObjective(expr, gp.GRB.MINIMIZE);
+    m.optimize()
+
+    if (m.status == gp.GRB.OPTIMAL):
+        print 'c, ', [c[i,t].x for i in range(N) for t in range(T)]
+        print 'd, ', [d[i,t].x for i in range(N) for t in range(T)]
+        lmbda_ = [(2 * lmbda01[k].x - 1) for k in range(dtheta)]
+        return [m.objVal, lmbda_]
+    else:
+        return [None, None]
+
+
+
+def get_reward_coefs(states, Phi_fn, psi_fn):
+    '''
+    :param states: N x T x dS
+    :param Phi_fn:
+    :return:
+    '''
+    N= states.shape[0]; T = states.shape[1]
+    return 1.0/(N*T)*np.sum([ Phi_fn(states[i,t,:]) * psi_fn(states[i,t,:]) for i in range(N) for t in range(T) ],axis=0)
+
+
+
+def primal_scalarized_L1_min_resid(gamma, a_bnd,b_bnd, s_a_giv_sprime, p_infty_b, pe_s, p_a1_s,
+                       nS, nA, tight= True, quiet = True):
+    '''
+    opt for closest w for the observed behavior policy
+    '''
+    for k in range(nS):
+        assert np.isclose((s_a_giv_sprime[:,:,k].sum()), 1,atol = 0.01)
+    assert np.isclose(sum(p_infty_b), 1)
+    m = gp.Model()
+    p_infty_b = p_infty_b.flatten()
+    w = m.addVars(nS)
+    z = m.addVars(nS)
+    if quiet: m.setParam("OutputFlag", 0)
+    epsilon = 0.5
+
+    for k in range(nS):
+        m.addConstr( z[k] >= (-1*w[k] + gp.quicksum( w[j]*gp.quicksum([s_a_giv_sprime[j,a,k] * (pe_s[a,j] * p_a1_s[a,j]) for a in range(nA)]) for j in range(nS) )) )
+        m.addConstr( z[k] >= -1*(-1*w[k] + gp.quicksum( w[j]*gp.quicksum([s_a_giv_sprime[j,a,k] * (pe_s[a,j] * p_a1_s[a,j]) for a in range(nA)]) for j in range(nS) )) )
+    m.addConstr(gp.quicksum(w[k] * p_infty_b[k] for k in range(nS)) == 1)
+    m.update()
+    expr = gp.quicksum(z)
+    m.setObjective(expr, gp.GRB.MINIMIZE);
+    m.optimize()
+    if (m.status == gp.GRB.OPTIMAL):
+        w_ = np.asarray([w[j].x for j in range(nS) ])
+        return [m.objVal, w_]
+    else:
+        g = None
+        return [None, g]
+
+def primal_scalarized_L1_min_resid_given_g(gamma, g, a_bnd,b_bnd, s_a_giv_sprime, p_infty_b, pe_s, p_a1_s,
+                       nS, nA, tight= True, quiet = True):
+    '''
+    opt for closest w for the observed behavior policy
+    given g
+    '''
+    for k in range(nS):
+        assert np.isclose((s_a_giv_sprime[:,:,k].sum()), 1,atol = 0.01)
+    assert np.isclose(sum(p_infty_b), 1)
+    m = gp.Model()
+    p_infty_b = p_infty_b.flatten()
+    w = m.addVars(nS)
+    z = m.addVars(nS)
+    if quiet: m.setParam("OutputFlag", 0)
+    epsilon = 0.5
+
+    for k in range(nS):
+        m.addConstr( z[k] >= (-1*w[k] + gp.quicksum( w[j]*gp.quicksum([s_a_giv_sprime[j,a,k] * (pe_s[a,j] * g[k,a,j]) for a in range(nA)]) for j in range(nS) )) )
+        m.addConstr( z[k] >= -1*(-1*w[k] + gp.quicksum( w[j]*gp.quicksum([s_a_giv_sprime[j,a,k] * (pe_s[a,j] * g[k,a,j]) for a in range(nA)]) for j in range(nS) )) )
+    m.addConstr(gp.quicksum(w[k] * p_infty_b[k] for k in range(nS)) == 1)
+    m.update()
+    expr = gp.quicksum(z)
+    m.setObjective(expr, gp.GRB.MINIMIZE);
+    m.optimize()
+    if (m.status == gp.GRB.OPTIMAL):
+        w_ = np.asarray([w[j].x for j in range(nS) ])
+        return [m.objVal, w_]
+    else:
+        g = None
+        return [None, g]
+
+def get_esteqn(w, g, s_a_giv_sprime, p_infty_b_s, p_e_s, p_a1_s, nS):
+    est_eqn = np.zeros(nS)
+    for k in range(nS):
+        est_eqn[k] = np.abs(-1*w[k] *p_infty_b_s[k] + sum( [w[j] * sum([s_a_giv_sprime[j, a, k] * (g[k, a, j] * p_e_s[a, j]) *p_infty_b_s[k] for a in range(nA)]) for j in range(nS)]))
+    return est_eqn
+
+
+def get_epsradius(w, gamma, a_bnd, b_bnd, s_a_giv_sprime, p_infty_b, pe_s, p_a1_s,
+                                   nS, nA, tight=True, quiet=True, minimize=True):
+    '''
+    opt for closest w for the observed behavior policy
+    '''
+    for k in range(nS):
+        assert np.isclose((s_a_giv_sprime[:, :, k].sum()), 1, atol=0.01)
+    assert np.isclose(sum(p_infty_b), 1)
+    m = gp.Model()
+    p_infty_b = p_infty_b.flatten()
+    g = m.addVars(nS,nA,nS) #\beta_k(a\mid j)
+    z = m.addVars(nS)
+    t = m.addVars(nS)
+    if quiet: m.setParam("OutputFlag", 0)
+
+    for k in range(nS):
+        m.addConstr(t[k] == -1 * w[k] + gp.quicksum(w[j] * gp.quicksum([s_a_giv_sprime[j, a, k] * (pe_s[a, j] * g[k,a, j]) for a in range(nA)])
+            for j in range(nS)) )
+        m.addConstr(z[k] == gp.abs_( t[k] ) )
+
+    for a in range(nA):
+        if tight:
+            m.addConstr(gp.quicksum(
+                [g[k, a, j] * s_a_giv_sprime[j, a, k] * p_infty_b[k] for k in range(nS) for j in range(nS)]) == 1)
+    for k in range(nS):
+        for a in range(nA):
+            for j in range(nS):
+                m.addConstr(g[k,a,j] <= b_bnd[a,j])
+                m.addConstr(g[k,a,j] >= a_bnd[a,j])
+    m.update()
+    expr = gp.quicksum( z )
+    if minimize:
+        m.setObjective(expr, gp.GRB.MINIMIZE);
+    else:
+        m.setObjective(expr, gp.GRB.MAXIMIZE);
+    m.optimize()
+
+    if (m.status == gp.GRB.OPTIMAL):
+        feasibility = True
+        g_ = np.asarray([g[k,a,j].x for k in range(nS) for a in range(nA) for j in range(nS) ]).reshape([nS,nA,nS])
+        return [m.objVal, g_]
+    else:
+        g = None
+    return [None, g]
+
+def primal_scalarized_L1_min_epsradius(g, epsradius, phi, gamma, a_bnd, b_bnd, s_a_giv_sprime, p_infty_b, pe_s, p_a1_s,
+                                   nS, nA, tight=True, quiet=True, sense_min = True):
+    '''
+    minimize over w within epsilonradius of feasible w,g
+    '''
+    for k in range(nS):
+        assert np.isclose((s_a_giv_sprime[:, :, k].sum()), 1, atol=0.01)
+    assert np.isclose(sum(p_infty_b), 1)
+    m = gp.Model()
+    p_infty_b = p_infty_b.flatten()
+    w = m.addVars(nS, lb = 0)
+    z = m.addVars(nS)
+    t = m.addVars(nS)
+    if quiet: m.setParam("OutputFlag", 0)
+
+    for k in range(nS):
+        m.addConstr(t[k] == -1 * w[k] *p_infty_b[k] + gp.quicksum(
+            w[j] * gp.quicksum([s_a_giv_sprime[j, a, k] * (g[k, a, j] * pe_s[a, j]) *p_infty_b[k] for a in range(nA)]) for j in
+            range(nS)))
+        m.addConstr(z[k] == gp.abs_(t[k]))
+
+
+    m.addConstr( gp.quicksum( z[k] for k in range(nS) ) <= epsradius )
+    # constraints on w
+    m.addConstr( gp.quicksum(w) >= 0.1 )
+    m.addConstr( gp.quicksum(w[k] * p_infty_b[k] for k in range(nS)) == 1)
+    m.update()
+    expr = gp.LinExpr();
+    if sense_min:
+        expr += gp.quicksum( [w[k] * phi[k]*p_infty_b[k] for k in range(nS)] )
+
+    else:
+        expr += gp.quicksum( -1*[w[k] * phi[k]*p_infty_b[k] for k in range(nS)] )
+    m.setObjective(expr, gp.GRB.MAXIMIZE);
+    m.optimize()
+    print [t[k].x for k in range(nS)]
+    if (m.status == gp.GRB.OPTIMAL):
+        w_ = np.asarray([w[j].x for j in range(nS)])
+        return [m.objVal, w_]
+    else:
+        g = None
+    return [None, g]
+
+def primal_l1_check_realizability(w, gamma, a_bnd,b_bnd, s_a_giv_sprime, p_infty_b, pe_s, p_a1_s,
+                       nS, nA, tight= True, quiet = True):
+    '''
+    is w realizable under any g?
+    '''
+    for k in range(nS):
+        assert np.isclose((s_a_giv_sprime[:,:,k].sum()), 1,atol = 0.01)
+    assert np.isclose(sum(p_infty_b), 1)
+    m = gp.Model()
+    p_infty_b = p_infty_b.flatten()
+    g = m.addVars( nS, nA, nS, lb = 1,name='g')
+    z = m.addVars(nS)
+    if quiet: m.setParam("OutputFlag", 0)
+    epsilon = 0.5
+
+    for k in range(nS):
+        m.addConstr( z[k] >= (-1*w[k]*p_infty_b[k] + gp.quicksum( w[j]*gp.quicksum([s_a_giv_sprime[j,a,k] * (pe_s[a,j] * p_a1_s[a,j])*p_infty_b[k] for a in range(nA)]) for j in range(nS) )) )
+        m.addConstr( z[k] >= -1*(-1*w[k]*p_infty_b[k] + gp.quicksum( w[j]*gp.quicksum([s_a_giv_sprime[j,a,k] * (pe_s[a,j] * p_a1_s[a,j])*p_infty_b[k] for a in range(nA)]) for j in range(nS) )) )
+    m.addConstr(gp.quicksum(w[k] * p_infty_b[k] for k in range(nS)) == 1)
+
+      # \beta_k(a\mid j)
+
+    for a in range(nA):
+        if tight:
+            m.addConstr(gp.quicksum(
+                [g[k, a, j] * s_a_giv_sprime[j, a, k] * p_infty_b[k] for k in range(nS) for j in range(nS)]) == 1)
+
+    m.update()
+    expr = gp.quicksum(z)
+    m.setObjective(expr, gp.GRB.MINIMIZE);
+    m.optimize()
+    if (m.status == gp.GRB.OPTIMAL):
+        feasibility = True
+        g = np.asarray([g[k,a,j].x for k in range(nS) for a in range(nA) for j in range(nS) ]).reshape([nS,nA,nS])
+        return [m.objVal, g]
+    else:
+        g = None
+        return [None, g]
+
+
+def cvx_opt_epsradius(g, epsradius, phi, s_a_giv_sprime, p_infty_b_s, p_e_s,
+                       nS, nA, sense = 1, vbs = False):
+
+    A = np.zeros([nS,nS])
+    for k in range(nS):
+        for j in range(nS):
+            A[k,j] += sum( [ s_a_giv_sprime[j,a,k]*p_infty_b_s[k] * (p_e_s[a,j] *g[k,a,j] ) for a in range(nA)] )
+        A[k,k] -= p_infty_b_s[k]
+
+    w = cvx.Variable(nS)
+    obj = cvx.Minimize(cvx.sum(w*np.multiply(p_infty_b_s, phi))) if sense == 1 else cvx.Maximize(
+        cvx.sum(w*np.multiply(p_infty_b_s, phi)))   # probably need to change maximize code
+    constraints = [ cvx.norm( A*w , 1 ) <= epsradius,
+                    cvx.sum(p_infty_b_s*w) == 1,
+                    cvx.sum(w) >= 0.1, w >= 0
+                   ]
+
+    prob = cvx.Problem(obj, constraints)
+    prob.solve(verbose=vbs)
+    return [prob, w]
+
+
+def sdp_relax(phi, a_bnd, b_bnd, s_a_giv_sprime, joint_s_a_sprime,  p_infty_b_s, p_e_s,
+                       nS, nA, sense = 1, vbs = False, tight = True):
+
+    p_infty_a = joint_s_a_sprime.sum(axis=(0,2))
+    joint_ak = joint_s_a_sprime.sum(axis=0)
+    p_infty_b_k_given_a = np.zeros([nS,nA])
+    for k in range(nS):
+        for a in range(nA):
+            p_infty_b_k_given_a[k,a] = joint_ak[a,k] / p_infty_a[a]
+
+
+    w = cvx.Variable(nS)
+    g = [None] * nS;
+    for k in range(nS):
+        g[k] = cvx.Variable((nA,nS))
+    nX = nS*nA*nS + nS
+    x = cvx.Variable(nX)
+    X = cvx.Variable((nX, nX), symmetric=True)
+    bX = cvx.Variable( (nX+1, nX+1), symmetric=True )
+
+    P = [None] * nS # list of matrices
+    obj = cvx.Minimize( np.multiply(p_infty_b_s, phi).T * w ) if sense == 1 else cvx.Maximize(
+        np.multiply(p_infty_b_s, phi).T * w )   # probably need to change maximize code
+    constraints = [ cvx.sum(p_infty_b_s*w) == 1,
+                    cvx.sum(w) >= 0.1, w >= 0
+                   ]
+    # Build coefficient matrices
+    for k in range(nS):
+        P[k] = lil_matrix((nX, nX))
+        for a in range(nA):
+            for j in range(nS):
+                ind = np.ravel_multi_index([k, a, j], (nS, nA, nS))
+                # fill mixed terms
+                P[k][ ind, nS*nA*nS+j ] = p_e_s[a,j] * s_a_giv_sprime[j,a,k]*p_infty_b_s[k]
+                # P[k][ nS*nA*nS+j, ind ] = 0.5 * p_e_s[a,j] * s_a_giv_sprime[j,a,k]*p_infty_b_s[k]
+    eps = 0.05
+    # a control variate
+
+    for a in range(nA):
+        constraints += [ cvx.sum([cvx.sum( [g[k][a, j] * s_a_giv_sprime[j, a, k] * p_infty_b_s[k] for j in range(nS)] ) for k in range(nS)])  == 1]
+
+    for k in range(nS):
+        constraints += [x[nS*nA*nS + k] == w[k],  #,
+                        cvx.trace(X* P[k]) - w[k] * p_infty_b_s[k] <= 0.1 ,cvx.trace(X* P[k])- w[k] * p_infty_b_s[k]  >= -0.1
+                        ]
+        for a in range(nA):
+            # s,a control variate
+            # if tight:
+                # constraints += [cvx.sum( [g[k][a, j] *s_a_giv_sprime[j,a,k]*p_infty_b_s[k] for j in range(nS) ]) == p_infty_b_k_given_a[k, a]   ]
+            # else:
+            #     constraints += [cvx.sum(g[k][:, j] * s_a_giv_sprime[j, :, k] * p_infty_b_s[k]) - p_infty_b_k_given_a[k, a] <= eps,
+            #                     p_infty_b_k_given_a[k, a] - cvx.sum(g[k][:, j] * s_a_giv_sprime[j, :, k] * p_infty_b_s[k])  <= eps]
+
+            for j in range(nS):
+                ind = np.ravel_multi_index([k,a,j], (nS,nA,nS))
+                # bounds
+                constraints += [ x[ ind ] == g[k][a,j],
+                                 g[k][a,j] <= b_bnd[a,j],
+                                 g[k][a, j] >= a_bnd[a, j],
+                                 x[ ind ] <= b_bnd[a, j],
+                                 x[ ind ] >= a_bnd[a, j]
+                                 ]
+
+    # # bmat constraint
+    constraints += [bX[0:nX, 0:nX] == X, bX[0:nX,-1] == x, bX[-1,0:nX] == x.T, bX[-1,-1] == 0]
+    # blockx = cvx.hstack( [ [ X, x.reshape([nX,1]) ], [x.reshape([1,nX]), 0]])
+    constraints += [ bX >> 0  ]
+
+    prob = cvx.Problem(obj, constraints)
+    prob.solve(verbose=vbs, solver = 'MOSEK', mosek_params = {mosek.dparam.optimizer_max_time:  50, mosek.dparam.basis_tol_s:1e-1})#,abstol = 1e-2, reltol = 1e-3, feastol=1e-2)
+    return [prob, w, g]
+
+
+
+def generate_data_get_bounds(phi, nns, nS, nA, nU, nSmarg, P, Pi, state_dist, n, PI_E, uniform_pi, mu, logGams_full, tight = True):
+    ngams = len(logGams_full)
+    Nns = len(nns)
+    min_bnds = [[None] * ngams for m_ in range(Nns)];
+    max_bnds = [[None] * ngams for m_ in range(Nns)];
+
+    for ind_n, nn in enumerate(nns):
+        n = nn
+        print 'n', n
+        # generate data
+        [stateChangeHist, stateHist, a_s, s_a_sprime, p_infty_b_su, distr_hist] = simulate_rollouts(
+            nS, nA, P, Pi, state_dist, n)
+        quiet = True
+        p_infty_b_s = (reshape_byxrow(p_infty_b_su.T, nU).T).flatten()
+        p_infty_b_su = p_infty_b_su.flatten()
+
+        #laplace smoothing
+        if (p_infty_b_s == 0).any():
+            smoother = np.ones(p_infty_b_s.shape)*1.0 / len(p_infty_b_s); p_infty_b_s = smoother *0.01+ p_infty_b_s*0.99
+        # agg history and process
+
+
+        [ p_a1_su, joint_s_a_sprime, s_a_giv_sprime ] = get_auxiliary_info_from_traj(stateChangeHist,
+                                                stateHist, a_s, s_a_sprime, p_infty_b_su, distr_hist, nA,nS)
+        p_e_su = PI_E*mu + uniform_pi*(1-mu); p_e_s = reshape_byxrow(p_e_su.T,nU).T / nU
+        [aggStateHist, p_a1_s, p_e_s, agg_s_a_sprime, joint_s_a_sprime_agg, s_a_giv_sprime_agg] = agg_history(
+                    stateHist, s_a_sprime, p_infty_b_s, a_s, p_e_su, nA, nS, nSmarg, nU)
+        # laplace smoothing
+        if (p_a1_s == 0).any():
+            smoother = np.ones(p_a1_s.shape)*1.0/len(p_a1_s.flatten()); p_a1_s = smoother *0.01+ p_a1_s*0.99
+
+        for ind,logGam in enumerate(logGams_full):
+            sense_min = False; [a_bnd, b_bnd] = get_bnds_as( p_a1_s, logGam )
+            [objVal, w_, m] = primal_opt_outer_L1_test_function_joint_distn(None, phi, a_bnd,b_bnd, joint_s_a_sprime_agg, p_infty_b_s, p_e_s, nSmarg, nA, tight, sense_min, quiet)
+            min_bnds[ind_n][ind] = objVal#; w_min_bnds[ind] = w_;
+            sense_min = True
+            [objVal, w_, m] = primal_opt_outer_L1_test_function_joint_distn(None, phi, a_bnd,b_bnd, joint_s_a_sprime_agg, p_infty_b_s, p_e_s, nSmarg, nA, tight, sense_min, quiet)
+            max_bnds[ind_n][ind] = objVal#; w_max_bnds[ind] = w_;
+    pickle.dump([min_bnds, max_bnds, nns, logGams_full], open('output-log'+datetime.now().strftime('%Y-%m-%d-%H-%M-%S')+'.p','wb') )
+    return [min_bnds, max_bnds]
 
 
 ### simulate from a single trajectory
